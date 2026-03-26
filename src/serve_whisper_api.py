@@ -16,6 +16,7 @@ import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers.models.whisper.tokenization_whisper import LANGUAGES, TO_LANGUAGE_CODE
 
 
 def default_finetuned_model_dir() -> str:
@@ -52,19 +53,20 @@ DANISH_DETECTION_MARGIN_THRESHOLD = float(
 )
 
 
-LANGUAGE_ALIASES = {
-    "da": "Danish",
-    "danish": "Danish",
-    "dansk": "Danish",
-    "en": "English",
-    "english": "English",
-    "de": "German",
-    "german": "German",
-    "fr": "French",
-    "french": "French",
-    "es": "Spanish",
-    "spanish": "Spanish",
-}
+WHISPER_LANGUAGE_NAMES = {code: name.title() for code, name in LANGUAGES.items()}
+LANGUAGE_ALIASES = {code: display_name for code, display_name in WHISPER_LANGUAGE_NAMES.items()}
+LANGUAGE_ALIASES.update(
+    {display_name.lower(): display_name for display_name in WHISPER_LANGUAGE_NAMES.values()}
+)
+LANGUAGE_ALIASES.update(
+    {
+        alias.lower(): WHISPER_LANGUAGE_NAMES[language_code]
+        for alias, language_code in TO_LANGUAGE_CODE.items()
+        if language_code in WHISPER_LANGUAGE_NAMES
+    }
+)
+LANGUAGE_ALIASES["dansk"] = "Danish"
+SUPPORTED_LANGUAGE_OPTIONS = sorted(set(WHISPER_LANGUAGE_NAMES.values()))
 
 
 @dataclass(frozen=True)
@@ -389,6 +391,10 @@ app = FastAPI(title="Whisper ASR API", version="1.0.0")
 
 
 def render_home_page() -> str:
+    language_options_html = "\n".join(
+        f'            <option value="{language_name}">{language_name}</option>'
+        for language_name in SUPPORTED_LANGUAGE_OPTIONS
+    )
     return """
 <!doctype html>
 <html lang="en">
@@ -979,11 +985,7 @@ def render_home_page() -> str:
           <label for="language">Language</label>
           <select id="language" name="language">
             <option value="">Auto-detect</option>
-            <option value="Danish">Danish</option>
-            <option value="English">English</option>
-            <option value="German">German</option>
-            <option value="French">French</option>
-            <option value="Spanish">Spanish</option>
+{{LANGUAGE_OPTIONS}}
           </select>
         </div>
 
@@ -1395,7 +1397,7 @@ def render_home_page() -> str:
   </script>
 </body>
 </html>
-"""
+""".replace("{{LANGUAGE_OPTIONS}}", language_options_html)
 
 
 @app.get("/", response_class=HTMLResponse)
