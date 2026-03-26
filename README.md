@@ -1,41 +1,95 @@
 # Whisper Fine-Tuning
 
-Minimal handoff repo for fine-tuning and serving `openai/whisper-small` for Danish ASR.
+Small repo for training, evaluating, and serving `openai/whisper-small` for speech recognition.
 
-This repo keeps only the code needed to:
+This project is built around three tasks:
 
-- prepare training data from Hugging Face datasets or a local Samromur export
-- fine-tune Whisper Small
-- evaluate a saved checkpoint against the base model
-- serve the base and fine-tuned models behind a small FastAPI API
+- prepare speech datasets
+- fine-tune Whisper
+- serve a local transcription API
 
-Large local artifacts such as datasets, checkpoints, archives, caches, and notebook outputs are intentionally excluded from version control.
+Large local files such as datasets, checkpoints, and caches are intentionally not tracked in Git.
 
-## Project layout
+## Quick Start
 
-- `src/prepare_whisper_data.py`: dataset loading and audio preprocessing
-- `src/load_whisper_model.py`: model and processor loading
-- `src/train_whisper.py`: training entrypoint
-- `src/evaluate_whisper.py`: evaluation entrypoint
-- `src/serve_whisper_api.py`: FastAPI service and minimal demo page
+### 1. Clone the repo
 
-## Setup
+```bash
+git clone https://github.com/hallgrimurth/Whisper-Finetuning.git
+cd Whisper-Finetuning
+```
 
-Install PyTorch for your platform first, then install the remaining dependencies:
+### 2. Create a virtual environment
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 3. Install PyTorch
+
+Install the correct PyTorch build for your machine first.
+
+Example for CUDA 12.4:
+
+```bash
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
+
+If you are using CPU only, install the CPU build from the PyTorch website.
+
+### 4. Install project dependencies
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## Training
+### 5. Start using the repo
 
-Default training targets the Danish CORAL `read_aloud` split:
+Train:
 
 ```bash
-python src/train_whisper.py \
-  --dataset-source coral \
-  --language Danish \
-  --output-dir outputs/whisper-small-coral
+python src/train_whisper.py --dataset-source coral --language Danish --output-dir outputs/whisper-small-coral
+```
+
+Evaluate:
+
+```bash
+python src/evaluate_whisper.py --dataset-source coral --language Danish --checkpoint-path outputs/whisper-small-coral
+```
+
+Serve the API:
+
+```bash
+python -m uvicorn src.serve_whisper_api:app --host 0.0.0.0 --port 8000
+```
+
+## Repo Structure
+
+- `src/prepare_whisper_data.py`: loads datasets and prepares audio/text for Whisper
+- `src/load_whisper_model.py`: loads the Whisper model and processor
+- `src/train_whisper.py`: fine-tuning entrypoint
+- `src/evaluate_whisper.py`: evaluation entrypoint
+- `src/serve_whisper_api.py`: FastAPI transcription service and demo page
+- `outputs/`: local checkpoints and evaluation results
+
+## Common Workflows
+
+### Train a model
+
+Default training uses the Danish CORAL `read_aloud` split.
+
+```bash
+python src/train_whisper.py --dataset-source coral --language Danish --output-dir outputs/whisper-small-coral
 ```
 
 Useful options:
@@ -43,45 +97,55 @@ Useful options:
 - `--dataset-source coral|fleurs|samromur`
 - `--coral-config read_aloud`
 - `--fleurs-config da_dk`
-- `--max-train-samples` and `--max-eval-samples` for quick smoke runs
-- `--report-to wandb` if experiment tracking is wanted
+- `--max-train-samples` for a quick smoke test
+- `--max-eval-samples` for a smaller validation run
+- `--report-to wandb` to log training metrics
 
-## Evaluation
-
-Evaluate a fine-tuned checkpoint against the base model on the held-out split for the chosen dataset source:
+### Evaluate a checkpoint
 
 ```bash
-python src/evaluate_whisper.py \
-  --dataset-source coral \
-  --language Danish \
-  --checkpoint-path outputs/whisper-small-coral
+python src/evaluate_whisper.py --dataset-source coral --language Danish --checkpoint-path outputs/whisper-small-coral
 ```
 
-The script writes a detailed JSON report to `outputs/whisper_eval_results.json`.
+The evaluation report is written to `outputs/whisper_eval_results.json`.
 
-## Serving
-
-Run the API locally:
+### Run the local API
 
 ```bash
 python -m uvicorn src.serve_whisper_api:app --host 0.0.0.0 --port 8000
 ```
 
-Environment variables:
+Open `http://localhost:8000` in your browser after startup.
 
-- `WHISPER_BASE_MODEL`: base model id, defaults to `openai/whisper-small`
-- `WHISPER_FINETUNED_MODEL`: path to the fine-tuned checkpoint, defaults to `outputs/whisper-small-coral`
+## API Notes
 
-API behavior:
+`POST /transcribe` accepts an audio file and an optional `language`.
 
-- `POST /transcribe` accepts an uploaded audio file and optional `language`
-- Danish requests route to the fine-tuned checkpoint
-- Other languages route to the base model
-- If no language is provided, the service detects language first and then selects the model
+Behavior:
 
-Returned metadata includes:
+- Danish requests use the Danish fine-tuned checkpoint
+- other explicit languages use the base Whisper model
+- if no language is provided, the service auto-detects language first and then selects the model
+
+Useful environment variables:
+
+- `WHISPER_BASE_MODEL`: base model id, default `openai/whisper-small`
+- `WHISPER_FINETUNED_MODEL`: checkpoint path, default `outputs/whisper-small-coral`
+- `WHISPER_LANGUAGE_DETECTION_WINDOW_SECONDS`: detection window size
+- `WHISPER_LANGUAGE_DETECTION_MAX_WINDOWS`: number of windows used for auto-detect
+- `WHISPER_LANGUAGE_DETECTION_MIN_VOICED_SECONDS`: minimum voiced audio before trusting detection
+- `WHISPER_DANISH_DETECTION_CONFIDENCE_THRESHOLD`: minimum confidence required to route to the Danish model
+- `WHISPER_DANISH_DETECTION_MARGIN_THRESHOLD`: minimum lead over the next-best detected language
+
+Response metadata includes:
 
 - `model_used`
 - `previous_model`
-- `transition_time_seconds`
+- `model_transition_time_seconds`
 - `inference_time_seconds`
+
+## Notes
+
+- Keep datasets and checkpoints out of Git
+- The repo assumes local outputs are written under `outputs/`
+- If a model path does not exist locally, the code falls back to loading from Hugging Face
