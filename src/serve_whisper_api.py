@@ -10,6 +10,7 @@ from threading import Lock
 from typing import Any
 
 import librosa
+import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -17,13 +18,38 @@ from fastapi.responses import HTMLResponse
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 
+def default_finetuned_model_dir() -> str:
+    outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
+    preferred = outputs_dir / "whisper-small-coral"
+    if preferred.exists():
+        return str(preferred)
+
+    for candidate in sorted(outputs_dir.glob("whisper-small-coral*")):
+        if candidate.is_dir():
+            return str(candidate)
+
+    return str(preferred)
+
+
 BASE_MODEL_ID = os.environ.get("WHISPER_BASE_MODEL", "openai/whisper-small")
 FINETUNED_MODEL_ID = os.environ.get(
     "WHISPER_FINETUNED_MODEL",
-    str(Path(__file__).resolve().parent.parent / "outputs" / "whisper-small-coral"),
+    default_finetuned_model_dir(),
 )
 TARGET_SAMPLE_RATE = 16000
 TASK = "transcribe"
+LANGUAGE_DETECTION_WINDOW_SECONDS = float(os.environ.get("WHISPER_LANGUAGE_DETECTION_WINDOW_SECONDS", "8"))
+LANGUAGE_DETECTION_MAX_WINDOWS = int(os.environ.get("WHISPER_LANGUAGE_DETECTION_MAX_WINDOWS", "3"))
+LANGUAGE_DETECTION_MIN_VOICED_SECONDS = float(
+    os.environ.get("WHISPER_LANGUAGE_DETECTION_MIN_VOICED_SECONDS", "1.5")
+)
+LANGUAGE_DETECTION_TRIM_TOP_DB = int(os.environ.get("WHISPER_LANGUAGE_DETECTION_TRIM_TOP_DB", "30"))
+DANISH_DETECTION_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("WHISPER_DANISH_DETECTION_CONFIDENCE_THRESHOLD", "0.8")
+)
+DANISH_DETECTION_MARGIN_THRESHOLD = float(
+    os.environ.get("WHISPER_DANISH_DETECTION_MARGIN_THRESHOLD", "0.15")
+)
 
 
 LANGUAGE_ALIASES = {
@@ -46,6 +72,16 @@ class ModelSpec:
     key: str
     model_id: str
     default_language: str | None
+
+
+@dataclass(frozen=True)
+class LanguageDetectionResult:
+    language_code: str | None
+    language_name: str | None
+    confidence: float
+    margin: float
+    voiced_seconds: float
+    analyzed_segments: int
 
 
 MODEL_SPECS = {
@@ -93,6 +129,45 @@ def load_audio_bytes(audio_bytes: bytes) -> tuple[Any, int]:
     return audio_array, sampling_rate
 
 
+def trim_audio_for_detection(audio_array: Any, sampling_rate: int) -> tuple[np.ndarray, float]:
+    normalized = np.asarray(audio_array, dtype=np.float32)
+    if normalized.size == 0:
+        return normalized, 0.0
+
+    trimmed_audio, _ = librosa.effects.trim(normalized, top_db=LANGUAGE_DETECTION_TRIM_TOP_DB)
+    if trimmed_audio.size == 0:
+        trimmed_audio = normalized
+
+    voiced_seconds = float(trimmed_audio.shape[0]) / float(sampling_rate) if sampling_rate else 0.0
+    return trimmed_audio, voiced_seconds
+
+
+def build_detection_segments(audio_array: np.ndarray, sampling_rate: int) -> list[np.ndarray]:
+    if audio_array.size == 0:
+        return []
+
+    segment_length = max(1, int(LANGUAGE_DETECTION_WINDOW_SECONDS * sampling_rate))
+    if audio_array.shape[0] <= segment_length:
+        return [audio_array]
+
+    max_start = audio_array.shape[0] - segment_length
+    segment_count = min(LANGUAGE_DETECTION_MAX_WINDOWS, max(1, int(np.ceil(audio_array.shape[0] / segment_length))))
+    start_positions = np.linspace(0, max_start, num=segment_count, dtype=int)
+    return [audio_array[start : start + segment_length] for start in start_positions]
+
+
+def resolve_model_source(model_id: str) -> tuple[str, bool]:
+    candidate = Path(model_id).expanduser()
+    if candidate.exists():
+        return str(candidate.resolve()), True
+
+    looks_like_local_path = bool(candidate.anchor) or model_id.startswith((".", "~")) or "\\" in model_id
+    if looks_like_local_path:
+        raise FileNotFoundError(f"Local model path not found: {candidate}")
+
+    return model_id, False
+
+
 class WhisperRuntime:
     def __init__(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -113,11 +188,13 @@ class WhisperRuntime:
         start = time.perf_counter()
         self._unload_current()
 
-        processor = WhisperProcessor.from_pretrained(spec.model_id)
+        model_source, local_only = resolve_model_source(spec.model_id)
+        processor = WhisperProcessor.from_pretrained(model_source, local_files_only=local_only)
         model = WhisperForConditionalGeneration.from_pretrained(
-            spec.model_id,
+            model_source,
             torch_dtype=self.dtype,
             low_cpu_mem_usage=True,
+            local_files_only=local_only,
         )
         model.to(self.device)
         model.eval()
@@ -138,27 +215,102 @@ class WhisperRuntime:
         transition_time = self._load_model(MODEL_SPECS[model_key])
         return previous_key, transition_time
 
-    def detect_language(self, audio_bytes: bytes) -> tuple[str, str | None, float]:
-        previous_key, transition_time = self.ensure_model("base")
+    def _language_probabilities(self, audio_array: np.ndarray, sampling_rate: int) -> dict[str, float]:
         assert self.model is not None
         assert self.processor is not None
 
-        audio_array, sampling_rate = load_audio_bytes(audio_bytes)
         inputs = self.processor.feature_extractor(
             audio_array,
             sampling_rate=sampling_rate,
             return_tensors="pt",
         )
         input_features = inputs["input_features"].to(device=self.device, dtype=self.dtype)
-        lang_ids = self.model.detect_language(input_features=input_features)
-        inverse_lang_map = {
-            token_id: token for token, token_id in self.model.generation_config.lang_to_id.items()
-        }
-        lang_token = inverse_lang_map.get(int(lang_ids[0].item()))
-        if lang_token is None:
-            lang_token = self.processor.tokenizer.convert_ids_to_tokens(int(lang_ids[0].item()))
-        detected_code = lang_token.replace("<|", "").replace("|>", "")
-        return detected_code, previous_key, transition_time
+
+        decoder_input_ids = torch.full(
+            (input_features.shape[0], 1),
+            self.model.generation_config.decoder_start_token_id,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        logits = self.model(
+            input_features=input_features[:, :, :3000],
+            decoder_input_ids=decoder_input_ids,
+            use_cache=False,
+        ).logits[:, -1]
+
+        lang_to_id = self.model.generation_config.lang_to_id
+        inverse_lang_map = {token_id: token for token, token_id in lang_to_id.items()}
+        language_token_ids = torch.tensor(list(lang_to_id.values()), device=logits.device, dtype=torch.long)
+        language_logits = logits.index_select(-1, language_token_ids)
+        language_probs = torch.softmax(language_logits, dim=-1)[0].detach().cpu().tolist()
+
+        scored_languages: dict[str, float] = {}
+        for token_id, probability in zip(language_token_ids.tolist(), language_probs):
+            token = inverse_lang_map[token_id]
+            language_code = token.replace("<|", "").replace("|>", "")
+            scored_languages[language_code] = float(probability)
+
+        return scored_languages
+
+    def should_route_to_danish_model(self, detection: LanguageDetectionResult) -> bool:
+        return (
+            detection.language_code == "da"
+            and detection.voiced_seconds >= LANGUAGE_DETECTION_MIN_VOICED_SECONDS
+            and detection.confidence >= DANISH_DETECTION_CONFIDENCE_THRESHOLD
+            and detection.margin >= DANISH_DETECTION_MARGIN_THRESHOLD
+        )
+
+    @torch.inference_mode()
+    def detect_language(self, audio_bytes: bytes) -> tuple[LanguageDetectionResult, str | None, float]:
+        previous_key, transition_time = self.ensure_model("base")
+        assert self.model is not None
+        assert self.processor is not None
+
+        audio_array, sampling_rate = load_audio_bytes(audio_bytes)
+        trimmed_audio, voiced_seconds = trim_audio_for_detection(audio_array, sampling_rate)
+        segments = build_detection_segments(trimmed_audio, sampling_rate)
+
+        if not segments:
+            detection = LanguageDetectionResult(
+                language_code=None,
+                language_name=None,
+                confidence=0.0,
+                margin=0.0,
+                voiced_seconds=voiced_seconds,
+                analyzed_segments=0,
+            )
+            return detection, previous_key, transition_time
+
+        aggregate_scores: dict[str, float] = {}
+        total_weight = 0.0
+        for segment in segments:
+            segment_probabilities = self._language_probabilities(segment, sampling_rate)
+            segment_seconds = max(float(segment.shape[0]) / float(sampling_rate), 1e-3)
+            total_weight += segment_seconds
+            for language_code, probability in segment_probabilities.items():
+                aggregate_scores[language_code] = aggregate_scores.get(language_code, 0.0) + (
+                    probability * segment_seconds
+                )
+
+        ranked_languages = sorted(
+            ((language_code, score / total_weight) for language_code, score in aggregate_scores.items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        detected_code = ranked_languages[0][0] if ranked_languages else None
+        detected_confidence = ranked_languages[0][1] if ranked_languages else 0.0
+        runner_up_confidence = ranked_languages[1][1] if len(ranked_languages) > 1 else 0.0
+        detection = LanguageDetectionResult(
+            language_code=detected_code,
+            language_name=language_code_to_name(detected_code),
+            confidence=detected_confidence,
+            margin=detected_confidence - runner_up_confidence,
+            voiced_seconds=voiced_seconds,
+            analyzed_segments=len(segments),
+        )
+        return detection, previous_key, transition_time
 
     @torch.inference_mode()
     def transcribe(self, audio_bytes: bytes, language: str | None) -> dict[str, Any]:
@@ -166,6 +318,14 @@ class WhisperRuntime:
         total_transition = 0.0
         previous_model: str | None = None
         detected_language: str | None = None
+        detection = LanguageDetectionResult(
+            language_code=None,
+            language_name=None,
+            confidence=0.0,
+            margin=0.0,
+            voiced_seconds=0.0,
+            analyzed_segments=0,
+        )
 
         if requested_language == "Danish":
             selected_key = "danish_finetuned"
@@ -174,9 +334,10 @@ class WhisperRuntime:
             selected_key = "base"
             transcription_language = requested_language
         else:
-            detected_language, previous_model, transition = self.detect_language(audio_bytes)
+            detection, previous_model, transition = self.detect_language(audio_bytes)
             total_transition += transition
-            selected_key = "danish_finetuned" if detected_language == "da" else "base"
+            detected_language = detection.language_code
+            selected_key = "danish_finetuned" if self.should_route_to_danish_model(detection) else "base"
             transcription_language = "Danish" if selected_key == "danish_finetuned" else None
 
         prev, transition = self.ensure_model(selected_key)
@@ -206,12 +367,18 @@ class WhisperRuntime:
         text = self.processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
         return {
+            "transcript": text,
             "text": text,
             "requested_language": requested_language,
             "detected_language": detected_language,
             "detected_language_name": language_code_to_name(detected_language),
+            "detected_language_confidence": round(detection.confidence, 4) if detected_language else None,
+            "detected_language_margin": round(detection.margin, 4) if detected_language else None,
+            "voiced_audio_seconds": round(detection.voiced_seconds, 4) if detected_language else None,
+            "language_detection_segments": detection.analyzed_segments if detected_language else 0,
             "model_used": selected_key,
             "previous_model": previous_model,
+            "model_transition_time_seconds": round(total_transition, 4),
             "transition_time_seconds": round(total_transition, 4),
             "inference_time_seconds": round(inference_time, 4),
         }
@@ -294,15 +461,19 @@ def render_home_page() -> str:
       min-height: calc(100vh - 64px);
       margin: 0 auto;
       display: grid;
-      grid-template-columns: minmax(320px, 390px) minmax(320px, 1fr);
-      gap: 72px;
+      grid-template-columns: minmax(0, 390px) minmax(0, 1fr);
+      gap: 56px;
       align-items: center;
     }
 
     .upload-card {
       position: relative;
       width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      overflow: hidden;
       background: var(--panel);
+      color: var(--ink);
       border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 34px;
       padding: 24px 28px 28px;
@@ -381,6 +552,12 @@ def render_home_page() -> str:
       display: grid;
       gap: 16px;
       margin-top: 28px;
+      min-width: 0;
+    }
+
+    form > * {
+      min-width: 0;
+      max-width: 100%;
     }
 
     input[type="file"] {
@@ -390,6 +567,8 @@ def render_home_page() -> str:
     .field {
       display: grid;
       gap: 8px;
+      width: 100%;
+      max-width: 100%;
     }
 
     .field label {
@@ -402,6 +581,8 @@ def render_home_page() -> str:
 
     select {
       width: 100%;
+      max-width: 100%;
+      min-width: 0;
       padding: 16px 20px;
       border: 1px solid var(--line);
       border-radius: 22px;
@@ -418,6 +599,9 @@ def render_home_page() -> str:
       gap: 0;
       margin-top: 6px;
       padding: 6px;
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden;
       border-radius: 20px;
       background: linear-gradient(135deg, var(--brand-a), var(--brand-b));
       box-shadow: 0 18px 36px rgba(163, 15, 28, 0.14);
@@ -480,6 +664,8 @@ def render_home_page() -> str:
     .recorder-panel {
       display: none;
       margin-top: 6px;
+      width: 100%;
+      max-width: 100%;
     }
 
     .recorder-panel.visible {
@@ -490,6 +676,9 @@ def render_home_page() -> str:
       display: flex;
       align-items: center;
       gap: 12px;
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden;
       padding: 16px 18px;
       background: var(--player-bg);
       color: white;
@@ -602,13 +791,14 @@ def render_home_page() -> str:
 
     .submit-button {
       width: 100%;
+      max-width: 100%;
       margin-top: 8px;
       padding: 18px 24px;
       border-radius: 999px;
       background: linear-gradient(135deg, var(--brand-a), var(--brand-b));
       color: white;
       font-size: 24px;
-      box-shadow: 0 24px 42px rgba(122, 51, 255, 0.2);
+      box-shadow: 0 24px 42px rgba(140, 15, 25, 0.24);
     }
 
     .mini-button:hover,
@@ -629,11 +819,15 @@ def render_home_page() -> str:
       text-align: center;
       font-size: 16px;
       color: var(--muted);
+      overflow-wrap: anywhere;
     }
 
     .result {
       display: none;
       margin-top: 4px;
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden;
       padding: 18px;
       border-radius: 24px;
       background: rgba(255, 244, 239, 0.92);
@@ -684,7 +878,10 @@ def render_home_page() -> str:
       display: grid;
       gap: 24px;
       max-width: 520px;
+      width: 100%;
+      min-width: 0;
       padding-right: 12px;
+      overflow-wrap: anywhere;
     }
 
     .story-eyebrow {
@@ -698,7 +895,7 @@ def render_home_page() -> str:
 
     .story-kicker {
       margin: 0;
-      font-size: clamp(4rem, 8vw, 6rem);
+      font-size: clamp(3.4rem, 7vw, 5.4rem);
       line-height: 0.95;
       letter-spacing: -0.06em;
       color: var(--accent);
@@ -713,9 +910,16 @@ def render_home_page() -> str:
       color: rgba(255, 234, 226, 0.92);
     }
 
-    @media (max-width: 1180px) {
+    @media (max-width: 1500px) {
       .shell {
-        gap: 42px;
+        min-height: auto;
+        grid-template-columns: 1fr;
+        gap: 32px;
+        max-width: 720px;
+      }
+
+      .story-panel {
+        padding-right: 0;
       }
     }
 
@@ -724,11 +928,7 @@ def render_home_page() -> str:
         padding: 22px 16px;
       }
 
-      .shell {
-        min-height: auto;
-        grid-template-columns: 1fr;
-        gap: 28px;
-      }
+      .shell { gap: 28px; }
 
       .upload-card {
         padding: 22px 18px 22px;
@@ -737,10 +937,6 @@ def render_home_page() -> str:
 
       .plus-button {
         margin-top: 72px;
-      }
-
-      .story-panel {
-        padding-right: 0;
       }
 
       .story-copy {
@@ -802,13 +998,6 @@ def render_home_page() -> str:
             <div class="speaker-icon" aria-hidden="true"></div>
             <input id="volume-slider" class="volume-slider" type="range" min="0" max="1" step="0.05" value="1" />
           </div>
-          <div class="player-row">
-            <div id="play-toggle-secondary" class="play-toggle" role="button" tabindex="0" aria-label="Play recording duplicate"></div>
-            <input id="timeline-slider-secondary" class="timeline-slider" type="range" min="0" max="1" step="0.01" value="0" />
-            <div id="time-readout-secondary" class="time-readout">0:00 / 0:00</div>
-            <div class="speaker-icon" aria-hidden="true"></div>
-            <input id="volume-slider-secondary" class="volume-slider" type="range" min="0" max="1" step="0.05" value="1" />
-          </div>
         </div>
 
         <button id="submit-button" class="submit-button" type="submit">Transcribe</button>
@@ -856,22 +1045,10 @@ def render_home_page() -> str:
     const recordingPreview = document.getElementById("recording-preview");
     const recorderPanel = document.getElementById("recorder-panel");
     const closeButton = document.querySelector(".card-close");
-    const playToggles = [
-      document.getElementById("play-toggle"),
-      document.getElementById("play-toggle-secondary"),
-    ];
-    const timelineSliders = [
-      document.getElementById("timeline-slider"),
-      document.getElementById("timeline-slider-secondary"),
-    ];
-    const timeReadouts = [
-      document.getElementById("time-readout"),
-      document.getElementById("time-readout-secondary"),
-    ];
-    const volumeSliders = [
-      document.getElementById("volume-slider"),
-      document.getElementById("volume-slider-secondary"),
-    ];
+    const playToggles = [document.getElementById("play-toggle")];
+    const timelineSliders = [document.getElementById("timeline-slider")];
+    const timeReadouts = [document.getElementById("time-readout")];
+    const volumeSliders = [document.getElementById("volume-slider")];
     const metricEls = {
       model_used: document.getElementById("model-used"),
       detected_language: document.getElementById("detected-language"),
@@ -1194,11 +1371,13 @@ def render_home_page() -> str:
           throw new Error(payload.detail || "Request failed");
         }
 
-        transcriptEl.textContent = payload.transcript || "No transcript returned.";
+        transcriptEl.textContent = payload.transcript || payload.text || "No transcript returned.";
         metricEls.model_used.textContent = payload.model_used || "n/a";
-        metricEls.detected_language.textContent = payload.detected_language || "n/a";
+        metricEls.detected_language.textContent =
+          payload.detected_language_name || payload.detected_language || "n/a";
         metricEls.previous_model.textContent = payload.previous_model || "n/a";
-        metricEls.transition_time.textContent = payload.model_transition_time_seconds ?? "n/a";
+        metricEls.transition_time.textContent =
+          payload.model_transition_time_seconds ?? payload.transition_time_seconds ?? "n/a";
         metricEls.inference_time.textContent = payload.inference_time_seconds ?? "n/a";
         metricEls.requested_language.textContent = payload.requested_language || "Auto-detect";
         resultEl.classList.add("visible");
