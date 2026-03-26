@@ -53,37 +53,6 @@ If you are using CPU only, install the CPU build from the PyTorch website.
 python -m pip install -r requirements.txt
 ```
 
-### 5. Start using the repo
-
-Train:
-
-```bash
-python src/train_whisper.py --dataset-source coral --language Danish --output-dir outputs/whisper-small-coral
-```
-
-Evaluate:
-
-```bash
-python src/evaluate_whisper.py --dataset-source coral --language Danish --checkpoint-path outputs/whisper-small-coral
-```
-
-Serve the API:
-
-```bash
-python -m uvicorn src.serve_whisper_api:app --host 0.0.0.0 --port 8000
-```
-
-## Repo Structure
-
-- `src/prepare_whisper_data.py`: loads datasets and prepares audio/text for Whisper
-- `src/load_whisper_model.py`: loads the Whisper model and processor
-- `src/train_whisper.py`: fine-tuning entrypoint
-- `src/evaluate_whisper.py`: evaluation entrypoint
-- `src/serve_whisper_api.py`: FastAPI transcription service and demo page
-- `outputs/`: local checkpoints and evaluation results
-
-## Common Workflows
-
 ### Train a model
 
 Default training uses the Danish CORAL `read_aloud` split.
